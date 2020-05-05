@@ -1,0 +1,188 @@
+diff --git a/server/mpm/worker/worker.c b/server/mpm/worker/worker.c
+index 0b10eeec87..61c8cf6412 100644
+--- a/server/mpm/worker/worker.c
++++ b/server/mpm/worker/worker.c
+@@ -72,6 +72,7 @@
+ 
+ #include <signal.h>
+ #include <limits.h>             /* for INT_MAX */
++#include <semaphore.h>
+ 
+ /* Limit on the total --- clients will be locked out if more servers than
+  * this are needed.  It is intended solely to keep the server from crashing
+@@ -186,6 +188,8 @@ typedef struct {
+     int pid;
+     int tid;
+     int sd;
++    int * total_workers;
++    sem_t * worker_sem;
+ } proc_info;
+ 
+ /* Structure used to pass information to the thread responsible for
+@@ -196,6 +200,8 @@ typedef struct {
+     apr_thread_t *listener;
+     int child_num_arg;
+     apr_threadattr_t *threadattr;
++    int total_workers;
++    sem_t worker_sem;
+ } thread_starter;
+ 
+ #define ID_FROM_CHILD_THREAD(c, t)    ((c * thread_limit) + t)
+@@ -546,10 +552,12 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t *thd, void * dummy)
+     apr_pool_t *ptrans = NULL;            /* Pool for per-transaction stuff */
+     apr_status_t rv;
+     ap_listen_rec *lr = NULL;
+    int have_idle_worker = 0;
+     int last_poll_idx = 0;
++    sem_t * worker_sem = ti->worker_sem;
++    int * total_workers = ti->total_workers;
+ 
+-    free(ti);
+ 
+     /* Unblock the signal used to wake this thread up, and set a handler for
+      * it.
+@@ -566,7 +574,9 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t *thd, void * dummy)
+         }
+         if (listener_may_exit) break;
+ 
+         if (!have_idle_worker) {
++	    if( (*total_workers) < threads_per_child && worker_queue_info->idlers <= zero_pt) sem_post(worker_sem);
+             rv = ap_queue_info_wait_for_idler(worker_queue_info, NULL);
+             if (APR_STATUS_IS_EOF(rv)) {
+                 break; /* we've been signaled to die now */
+@@ -717,10 +728,10 @@ static void * APR_THREAD_FUNC listener_thread(apr_thread_t *thd, void * dummy)
+     ap_queue_term(worker_queue);
+     dying = 1;
+     ap_scoreboard_image->parent[process_slot].quiescing = 1;
++    free(ti);
+     /* wake up the main thread */
+     kill(ap_my_pid, SIGTERM);     
+     apr_thread_exit(thd, APR_SUCCESS);
+     return NULL;
+ }
+@@ -846,6 +858,9 @@ static void create_listener_thread(thread_starter *ts)
+     my_info->pid = my_child_num;
+     my_info->tid = -1; /* listener thread doesn't have a thread slot */
+     my_info->sd = 0;
++    my_info->worker_sem = &(ts -> worker_sem);
++    my_info->total_workers = &(ts -> total_workers);
+     rv = apr_thread_create(&ts->listener, thread_attr, listener_thread,
+                            my_info, pruntime);
+     if (rv != APR_SUCCESS) {
+@@ -949,7 +964,8 @@ static void * APR_THREAD_FUNC start_threads(apr_thread_t *thd, void *dummy)
+     while (1) {
+         /* threads_per_child does not include the listener thread */
+         for (i = 0; i < threads_per_child; i++) {
+            int status = ap_scoreboard_image->servers[my_child_num][i].status;
++	    sem_wait(&ts->worker_sem);
+ 
+             if (status != SERVER_GRACEFUL && status != SERVER_DEAD) {
+                 continue;
+@@ -974,13 +990,11 @@ static void * APR_THREAD_FUNC start_threads(apr_thread_t *thd, void *dummy)
+                 /* let the parent decide how bad this really is */
+                 clean_child_exit(APEXIT_CHILDSICK);
+             }
++	    (ts->total_workers)++;
+             threads_created++;
+         }
+-        /* Start the listener only when there are workers available */
+-        if (!listener_started && threads_created) {
+-            create_listener_thread(ts);
+-            listener_started = 1;
+-        }
++	
+         if (start_thread_may_exit || threads_created == threads_per_child) {
+             break;
+         }
+@@ -1192,9 +1206,13 @@ static void child_main(int child_num_arg, int child_bucket)
+     ts->listener = NULL;
+     ts->child_num_arg = child_num_arg;
+     ts->threadattr = thread_attr;
++    ts->total_workers = 0;
++    sem_init(&(ts->worker_sem), 0, 0);
+ 
++    create_listener_thread(ts);
+     rv = apr_thread_create(&start_thread_id, thread_attr, start_threads,
+                            ts, pchild);   
+     if (rv != APR_SUCCESS) {
+         ap_log_error(APLOG_MARK, APLOG_ALERT, rv, ap_server_conf, APLOGNO(00282)
+                      "apr_thread_create: unable to create worker thread");
+diff --git a/server/mpm_fdqueue.c b/server/mpm_fdqueue.c
+index c81245078a..a50cb6a54a 100644
+--- a/server/mpm_fdqueue.c
++++ b/server/mpm_fdqueue.c
+@@ -20,29 +20,6 @@
+ 
+ #include <apr_atomic.h>
+ 
+-static const apr_uint32_t zero_pt = APR_UINT32_MAX/2;
+-
+-struct recycled_pool
+-{
+-    apr_pool_t *pool;
+-    struct recycled_pool *next;
+-};
+-
+-struct fd_queue_info_t
+-{
+-    apr_uint32_t volatile idlers; /**
+-                                   * >= zero_pt: number of idle worker threads
+-                                   * <  zero_pt: number of threads blocked,
+-                                   *             waiting for an idle worker
+-                                   */
+-    apr_thread_mutex_t *idlers_mutex;
+-    apr_thread_cond_t *wait_for_idler;
+-    int terminated;
+-    int max_idlers;
+-    int max_recycled_pools;
+-    apr_uint32_t recycled_pools_count;
+-    struct recycled_pool *volatile recycled_pools;
+-};
+ 
+ struct fd_queue_elem_t
+ {
+@@ -133,7 +110,7 @@ apr_status_t ap_queue_info_set_idle(fd_queue_info_t *queue_info,
+ apr_status_t ap_queue_info_try_get_idler(fd_queue_info_t *queue_info)
+ {
+     /* Don't block if there isn't any idle worker. */
+-    for (;;) {
++   for (;;) {
+         apr_uint32_t idlers = queue_info->idlers;
+         if (idlers <= zero_pt) {
+             return APR_EAGAIN;
+diff --git a/server/mpm_fdqueue.h b/server/mpm_fdqueue.h
+index 9aeedde30d..c8126140d0 100644
+--- a/server/mpm_fdqueue.h
++++ b/server/mpm_fdqueue.h
+@@ -40,8 +40,33 @@
+ #include <apr_thread_cond.h>
+ #include <apr_network_io.h>
+ 
+-struct fd_queue_info_t; /* opaque */
+-struct fd_queue_elem_t; /* opaque */
++
++static const apr_uint32_t zero_pt = APR_UINT32_MAX/2;
++
++struct recycled_pool
++{
++    apr_pool_t *pool;
++    struct recycled_pool *next;
++};
++
++
++
++struct fd_queue_info_t
++{
++    apr_uint32_t volatile idlers;
++                                   
++    apr_thread_mutex_t *idlers_mutex;
++    apr_thread_cond_t *wait_for_idler;
++    int terminated;
++    int max_idlers;
++    int max_recycled_pools;
++    apr_uint32_t recycled_pools_count;
++    struct recycled_pool *volatile recycled_pools;
++};
+ typedef struct fd_queue_info_t fd_queue_info_t;
+ typedef struct fd_queue_elem_t fd_queue_elem_t;
+ 
